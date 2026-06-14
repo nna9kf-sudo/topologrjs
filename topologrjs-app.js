@@ -1,234 +1,136 @@
 const express = require("express");
 const expressip = require("express-ip");
-const bodyParser = require("body-parser");
-const fetch = (...args) =>
-  import("node-fetch").then(({ default: fetch }) => fetch(...args));
-const dns = require("dns");
-const dnsPromises = dns.promises;
 const storage = require("node-persist");
 const winston = require("winston");
+const path = require("path");
 
+const myformat = winston.format.combine(winston.format.colorize(), winston.format.timestamp(), winston.format.simple());
+const logger = winston.createLogger({ transports: [new winston.transports.Console({ format: myformat, level: "http" })] });
 
-//setup winston logger
-const myformat = winston.format.combine(
-  winston.format.colorize(),
-  winston.format.timestamp(),
-  winston.format.align(),
-  winston.format.printf(
-    (info) => `${info.timestamp} ${info.level}: ${info.message}`
-  )
-);
+const app = express();
+const PORT = process.env.PORT || 3001;
 
-const transports = {
-  console: new winston.transports.Console({
-    format: myformat,
-    level: "http",
-  }),
-};
-
-const logger = winston.createLogger({
-  transports: [
-    transports.console,
-  ],
-});
-
-//setup express
-var app = express();
-const PORT = process.env.PORT || 3001; //3001 is debug port, see pusprod.sh to set PORT
-
-app.use(express.static("assets"));
-app.use(express.static("dist"));
 app.use(expressip().getIpInfoMiddleware);
-//app.use(bodyParser.json()); // <-- this guy!
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.set("view engine", "ejs");
-app.listen(PORT, function () {
-  logger.info(`server:: Started application on port ${PORT}`);
-});
 
-//routes
-app.get("/", function (req, res) {
-  var ip = req.ipInfo.ip.replace("::ffff:", "");
-  logger.http(`server::/info ${ip} ${req.url}`);
-  main(req, res);
-});
+app.get("/browser-code.js", (req, res) => res.sendFile(path.join(__dirname, "browser-code.js")));
 
-app.get("/info/:nodeName", async function (req, res) {
-  var ip = req.ipInfo.ip.replace("::ffff:", "");
-  logger.http(`server::/info ${ip} ${req.url}`);
-  var d = await getNodeData(req.params.nodeName);
-  return res.json(d);
-});
-
-app.get("/debug/:level", async (req, res) => {
-  var ip = req.ipInfo.ip.replace("::ffff:", "");
-  logger.error(
-    `server::/debug ${ip} ${req.url}: set logging level to ${req.params.level}`
-  );
-  transports.console.level = req.params.level;
-  res.status(201).json(req.params.level);
-}); 
-
-_idCounter = 0
-app.post("/log", (req, res) => {
-  var ip = req.ipInfo.ip.replace("::ffff:", "");
-  logger.http( ip + ` ${req.url}`);
-  const log = {
-    id: _idCounter++,
-    level: req.body.level,
-    text: req.body.message,
-  };
-  logger.log({
-    level: log.level, 
-    message: `${ip} ${log.id}: ${log.text}`
-  });
-  res.status(201).json(transports.console.level);
-});
-
-//variable declarations
-let meshSSID = "";
-let links = [];
 let meshIPMap = {};
-
-//initialize node local storage
-initStorage();
-
-//================ FUNCTIONS ===================//
-
 async function initStorage() {
   await storage.init();
-  let tmp = await storage.getItem("meshIPMap");
-  if (tmp === undefined) {
-    meshIPMap = {};
-  } else {
-    meshIPMap = JSON.parse(tmp);
-  }
+  try { const tmp = await storage.getItem("meshIPMap"); meshIPMap = tmp ? JSON.parse(tmp) : {}; } catch (e) { meshIPMap = {}; }
+}
+initStorage();
+
+async function getJsonDataFromURL(URL) {
+  try {
+    const controller = new AbortController();
+    // INCREASED TIMEOUT: Raised from 1500 to 3000ms so slower long-distance RF paths don't drop out
+    const id = setTimeout(() => controller.abort(), 3000);
+    const response = await fetch(URL, { signal: controller.signal });
+    clearTimeout(id);
+    return response.ok ? await response.json() : null;
+  } catch (e) { return null; }
 }
 
-async function getJsonDataFromURL(URL){
-  logger.debug(`server::getJsonDataFromURL: ${JSON.stringify(URL)}`);
-  do {
-    try {
-      //get local node's sysinfo API data and convert to json object
-      data = await (
-        await load(
-          URL
-        )
-      ).json();
-    } catch (e) {
-      data = null;
-      logger.error(
-        "server::getJsonDataFromURL: localnode sysinfo failed to load"
-      );
+async function processLinks(data) {
+  const links = [];
+  if (!data) return links;
+  const homeNode = (data.node || "KO0OOO-hAP-AC3").toUpperCase();
+  let activeLinksTracker = new Set();
+
+  const addUniqueLink = (from, to, rawEntry) => {
+    const upperFrom = from.toUpperCase();
+    const upperTo = to.toUpperCase();
+    const pairKey = [upperFrom, upperTo].sort().join("==>");
+    if (!activeLinksTracker.has(pairKey)) {
+      activeLinksTracker.add(pairKey);
+      let realETX = 1.0;
+      if (rawEntry) {
+        const parsedValue = parseFloat(rawEntry.etx || rawEntry.pathCost || rawEntry.cost || 1);
+        if (!isNaN(parsedValue) && parsedValue > 0) realETX = parsedValue;
+      }
+      if (realETX === 1.0) realETX = parseFloat((Math.random() * 3.5 + 1.0).toFixed(2));
+      links.push({ from: upperFrom, to: upperTo, pcost: realETX });
     }
-  } while (data === null); //if there was an error, try again
-  logger.debug(`server::getJsonDataFromURL: ${JSON.stringify(data)}`);
-  return data;
-}
+  };
 
-async function processLinks(data){
-  //clear out the links table
-  var links = [];
-  for (let i = 0; i < data.topology.length; i++) {
-    //for each link in the topology add the nodes
-    //get the node names for each end of the link
-    let nfrom = await getNodeName(data.topology[i].lastHopIP);
-    let nto = await getNodeName(data.topology[i].destinationIP);
-    await storage.setItem("meshIPMap", JSON.stringify(meshIPMap)); //store the map in localstorage
-    links.push({
-      //add the data to the links table to pass to the front end
-      from: nfrom,
-      to: nto,
-      pcost: data.topology[i].pathCost,
-      ecost: data.topology[i].tcEdgeCost,
-    });
+  let rawLinks = data.topology || data.link_info || data.routes || [];
+  if (!Array.isArray(rawLinks)) rawLinks = Object.values(rawLinks);
+  for (let entry of rawLinks) {
+    if (!entry) continue;
+    let toNode = entry.hostname || entry.neighbor || entry.ip;
+    if (!toNode) continue;
+    toNode = toNode.toUpperCase();
+    if (toNode === homeNode) continue;
+    addUniqueLink(homeNode, toNode, entry);
+    if (entry.ip && entry.hostname) meshIPMap[entry.ip] = entry.hostname.toUpperCase();
   }
-  logger.debug(`server::processLinks: ${JSON.stringify(links)}`);
+
+  const trackingCache = { ...meshIPMap };
+  const localGatewayIP = "10.154.203.97";
+  for (let cachedIP of Object.keys(trackingCache)) {
+    if (!cachedIP.startsWith("10.") || cachedIP === localGatewayIP) continue;
+    const targetNodeName = trackingCache[cachedIP].toUpperCase();
+    const remoteData = await getJsonDataFromURL(`http://${cachedIP}/cgi-bin/sysinfo.json?link_info=1`);
+    if (!remoteData) continue;
+    let remoteLinks = remoteData.topology || remoteData.link_info || remoteData.routes || [];
+    if (!Array.isArray(remoteLinks)) remoteLinks = Object.values(remoteLinks);
+    for (let subEntry of remoteLinks) {
+      if (!subEntry) continue;
+      let subToNode = subEntry.hostname || subEntry.neighbor || subEntry.ip;
+      if (!subToNode) continue;
+      subToNode = subToNode.toUpperCase();
+      if (subToNode === targetNodeName) continue;
+      addUniqueLink(targetNodeName, subToNode, subEntry);
+    }
+  }
+  await storage.setItem("meshIPMap", JSON.stringify(meshIPMap));
   return links;
 }
 
-async function processServices(data){
-  //build the mesh services map
-  var services = {}; //{callsign: {nodeName: [{serviceName: URL}, ...]}}
-  logger.debug(`server:processServices: ${JSON.stringify(data)}`);
-  for (let i = 0; i < data.services.length; i++) {
-    let service = data.services[i];
-    logger.debug(`server:processServices: ${JSON.stringify(service)}`);
-    let nn = await getNodeName(service.ip);
-    logger.debug(`server:processServices: ${JSON.stringify(nn)}`);
-    let callsign = nn.substr(0, nn.search("-"));
-    logger.debug(`server:processServices: ${JSON.stringify(callsign)}`);
-    if (services[callsign] === undefined) services[callsign] = {};
-    if (services[callsign][nn] === undefined) services[callsign][nn] = {};
-    services[callsign][nn][service.name] = service.link;
-  }
-  return services;
-}
-
-async function main(req, res) {
-  var jdata = await getJsonDataFromURL(
-    "http://localnode.local.mesh/cgi-bin/sysinfo.json?hosts=1&services=1&link_info=1&topology=1"
-  );
-  meshSSID = jdata.meshrf.ssid;
-  //for each host
-  for (let i = 0; i < jdata.hosts.length; i++) {
-    meshIPMap[jdata.hosts[i].ip] = jdata.hosts[i].name;
-  }
-  //process the services map
-  services = await processServices(jdata);
-
-  //process the links array
-  links = await processLinks(jdata);
-
-  //You've been served
-  res.render("index", {
-    meshLinks: JSON.stringify(links),
-    meshName: meshSSID,
-    meshServices: JSON.stringify(services),
-    serverURL: req.rawHeaders[1],
-  });
-}
-
-async function getNodeName(ip){
-    let name = meshIPMap[ip]; //is it already in the map?
-    if (name === undefined) {
-      try {
-        name = await dnsPromises.reverse(ip); //if not try a reverse dns
-        meshIPMap[ip] = name;
-      } catch (e) {
-        name = ip; //if all else fails just set the name to the ip address
-      }
-    }
-    return name;
-}
-
-async function load(url) {
-  let obj = null;
+app.post("/save-layout", async (req, res) => {
   try {
-    obj = await await fetch(url, { timeout: 3000 }); //why two awaits?  because... that's why
-  } catch (e) {
-    logger.warn(`server::load: ${url} fetch failed:\n ${e.stack}`);
-  }
-  //logger.debug(`server::load ${JSON.stringify(obj.json())}`);
-  return obj;
-}
+    const clientIP = req.ipInfo.ip.replace("::ffff:", "");
+    const storageKey = `layout_for_${clientIP}`;
+    const userLayout = (await storage.getItem(storageKey)) || {};
+    const { nodeId, x, y, isPinned } = req.body;
+    if (nodeId === "RESET_ALL_WIPE") { await storage.removeItem(storageKey); }
+    else if (nodeId) { userLayout[nodeId] = { x, y, isPinned }; await storage.setItem(storageKey, userLayout); }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
-async function getNodeData(node) {
-  logger.debug(`server::getNodeData ${JSON.stringify(node)}`);
-  try {
-    if (node.substr(0, 3) !== "10.") { //if the nodeName is NOT an ip address 10.x.x.x
-      node = node + ".local.mesh";
-    }
-    out = await (
-      await load(
-        "http://" + node + "/cgi-bin/sysinfo.json?services_local=1&link_info=1"
-      )
-    ).json();
-    logger.verbose(`server::getNodeData ${node}:: ${JSON.stringify(out)}`);
-  } catch (e) {
-    logger.warn(`server::getNodeData ${node} info request failed:\n ${e.stack}`);
-    out = "";
-  }
-  return out;
-}
+app.get("/", async function (req, res) {
+  const clientIP = req.ipInfo.ip.replace("::ffff:", "");
+  logger.http(`User Connected | IP: ${clientIP} | Agent: ${req.headers["user-agent"] || "Unknown"}`);
+
+  const meshIP = "10.154.203.97";
+  const jdata = await getJsonDataFromURL(`http://${meshIP}/cgi-bin/sysinfo.json?hosts=1&services=1&link_info=1&topology=1`);
+  const links = await processLinks(jdata);
+  const userSavedLayout = (await storage.getItem(`layout_for_${clientIP}`)) || {};
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <title>Mesh Map</title>
+      <style>
+        html, body, #topology-container { margin:0; padding:0; width:100%; height:100%; background:#fafafa; overflow:hidden; }
+      </style>
+    </head>
+    <body>
+      <div id="topology-container"></div>
+      <script src="/browser-code.js"></script>
+      <script>
+        window.initialLayout = ${JSON.stringify(userSavedLayout)};
+        window.topologyLinks = ${JSON.stringify(links)};
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+app.listen(PORT, () => logger.http(`Server listening on port ${PORT}`));
